@@ -1,0 +1,27 @@
+[package]
+name = "wirecap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = "0.7"
+tracing = "0.1"
+metrics = "0.24"
+chrono = "0.4"
+anyhow = "1"
+zstd = "0.13"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "wirecap-dump"
+path = "src/bin/dump.rs"
+
+[[bin]]
+name = "wirecap-tail"
+path = "src/bin/tail.rs"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }

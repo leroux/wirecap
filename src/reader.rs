@@ -1,7 +1,4 @@
 //! Wirecap file reading: open, iterate, discover, and tail.
-//!
-//! Provides [`WcapReader`] for batch reading closed files and
-//! [`WcapTailer`] for following a live `.wcap.active` file.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
@@ -9,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
-use crate::format::{self, Entry};
+use crate::buggify::{buggify, buggify_io_err};
+use crate::error::Error;
+use crate::format::{self, ReadEntry};
 
 // ---------------------------------------------------------------------------
 // File discovery
@@ -87,18 +86,30 @@ pub fn find_active_file(dir: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Reads records from a wirecap file (raw or zstd-compressed).
-/// Implements `Iterator<Item = Entry>` for ergonomic consumption.
+///
+/// Implements `Iterator<Item = Result<ReadEntry, Error>>` for ergonomic
+/// consumption. Errors are propagated, not swallowed.
 pub struct WcapReader {
     reader: Box<dyn Read>,
-    pub instance_id: String,
-    pub run_id: String,
+    instance_id: String,
+    run_id: String,
     done: bool,
+}
+
+impl std::fmt::Debug for WcapReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WcapReader")
+            .field("instance_id", &self.instance_id)
+            .field("run_id", &self.run_id)
+            .field("done", &self.done)
+            .finish()
+    }
 }
 
 impl WcapReader {
     /// Open a wirecap file. Handles `.wcap`, `.wcap.zst`, and `.wcap.recovered`.
-    /// Reads and validates the file header automatically.
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
+    pub fn open(path: &Path) -> Result<Self, Error> {
+        buggify_io_err!("reader file open"); // B14
         let file = File::open(path)?;
         let is_zst = path.to_str().is_some_and(|s| s.ends_with(".zst"));
 
@@ -108,6 +119,7 @@ impl WcapReader {
             Box::new(BufReader::new(file))
         };
 
+        buggify_io_err!("reader header read"); // B15
         let (instance_id, run_id) = format::read_file_header(&mut reader)?;
         debug!(
             path = %path.display(),
@@ -123,25 +135,39 @@ impl WcapReader {
             done: false,
         })
     }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
 }
 
 impl Iterator for WcapReader {
-    type Item = Entry;
+    type Item = Result<ReadEntry, Error>;
 
-    fn next(&mut self) -> Option<Entry> {
+    fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
         }
+        // B16: simulate mid-stream record read failure.
+        if buggify!() {
+            self.done = true;
+            return Some(Err(Error::Io(std::io::Error::other(
+                "buggified record read",
+            ))));
+        }
         match format::read_record(&mut self.reader) {
-            Ok(Some(entry)) => Some(entry),
+            Ok(Some(entry)) => Some(Ok(entry)),
             Ok(None) => {
                 self.done = true;
                 None
             }
             Err(e) => {
-                warn!(error = %e, "wcap read error");
                 self.done = true;
-                None
+                Some(Err(e))
             }
         }
     }
@@ -151,20 +177,17 @@ impl Iterator for WcapReader {
 // WcapTailer — follow a live .wcap.active file
 // ---------------------------------------------------------------------------
 
-/// Follows a live wirecap file being written by the recorder.
+/// Follows a live wirecap file being written by the writer.
 ///
-/// Handles:
-/// - Partial records at EOF (seeks back and retries later)
-/// - File rotation (detects new `.wcap.active` files)
-/// - Returns records in batches via [`read_batch`]
+/// Handles partial records at EOF (seeks back and retries later)
+/// and file rotation detection.
 pub struct WcapTailer {
     wcap_dir: PathBuf,
     reader: Option<BufReader<File>>,
     current_path: Option<PathBuf>,
     eof_count: u64,
-    /// File header fields from the currently open file.
-    pub instance_id: Option<String>,
-    pub run_id: Option<String>,
+    instance_id: Option<String>,
+    run_id: Option<String>,
 }
 
 impl WcapTailer {
@@ -200,7 +223,7 @@ impl WcapTailer {
                     true
                 }
                 Err(e) => {
-                    warn!(error = %e, "failed to open wcap file");
+                    warn!(error = %e, "failed to open wcap file for tailing");
                     false
                 }
             }
@@ -210,12 +233,11 @@ impl WcapTailer {
         }
     }
 
-    /// Read up to `max_batch` records, returning them as a `Vec`.
-    /// Returns an empty vec at EOF (caller should poll later).
+    /// Read up to `max_batch` records.
     ///
-    /// Handles partial records at EOF by seeking back to retry on the
-    /// next call, after the recorder has flushed more data.
-    pub fn read_batch(&mut self, max_batch: usize) -> Vec<Entry> {
+    /// Returns an empty vec at EOF (caller should poll later).
+    /// Handles partial records by seeking back to retry.
+    pub fn read_batch(&mut self, max_batch: usize) -> Vec<ReadEntry> {
         let reader = match &mut self.reader {
             Some(r) => r,
             None => return Vec::new(),
@@ -224,11 +246,19 @@ impl WcapTailer {
         let mut entries = Vec::new();
 
         for _ in 0..max_batch {
-            // Save position so we can rewind on partial record.
             let pos = match reader.stream_position() {
                 Ok(p) => p,
                 Err(_) => break,
             };
+
+            // B17: simulate a tailer read failure (treated as a partial record).
+            if buggify!() {
+                debug!("buggified tailer read; treating as partial");
+                if let Err(seek_err) = reader.seek(std::io::SeekFrom::Start(pos)) {
+                    warn!(error = %seek_err, "failed to rewind after buggified read");
+                }
+                break;
+            }
 
             match format::read_record(reader) {
                 Ok(Some(entry)) => {
@@ -236,19 +266,16 @@ impl WcapTailer {
                     entries.push(entry);
                 }
                 Ok(None) => {
-                    // Clean EOF — no partial read.
                     self.eof_count += 1;
-                    if self.eof_count % 100 == 0 {
+                    if self.eof_count.is_multiple_of(100) {
                         self.check_rotation();
                     }
                     break;
                 }
-                Err(e) => {
+                Err(_) => {
                     // Partial record — rewind to retry after more data arrives.
                     if let Err(seek_err) = reader.seek(std::io::SeekFrom::Start(pos)) {
                         warn!(error = %seek_err, "failed to rewind after partial read");
-                    } else {
-                        debug!(pos, error = %e, "partial record at EOF, rewound");
                     }
                     break;
                 }
@@ -258,7 +285,6 @@ impl WcapTailer {
         entries
     }
 
-    /// Check if a newer wcap file exists and switch to it.
     fn check_rotation(&mut self) {
         let current = match &self.current_path {
             Some(p) => p.clone(),
@@ -294,15 +320,17 @@ impl WcapTailer {
     pub fn current_path(&self) -> Option<&Path> {
         self.current_path.as_deref()
     }
+
+    pub fn instance_id(&self) -> Option<&str> {
+        self.instance_id.as_deref()
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Open a raw (uncompressed) wcap file for tailing. Returns the reader
-/// positioned after the file header, plus the header fields.
-fn open_raw_wcap(path: &Path) -> anyhow::Result<(BufReader<File>, String, String)> {
+fn open_raw_wcap(path: &Path) -> Result<(BufReader<File>, String, String), Error> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let (instance_id, run_id) = format::read_file_header(&mut reader)?;

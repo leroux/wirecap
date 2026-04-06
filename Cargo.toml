@@ -1,27 +1,25 @@
 [package]
 name = "wirecap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
+[features]
+# Enable probabilistic fault injection via ferro-buggify. Off by default.
+# When enabled, `buggify!()` call sites in src/writer.rs and src/reader.rs
+# can simulate I/O failures, fsync errors, rename failures, and compression
+# errors during tests. Activate with FERRO_BUGGIFY=1 env var at runtime.
+buggify = ["dep:ferro-buggify"]
+
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
-tokio-util = "0.7"
+tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 metrics = "0.24"
-chrono = "0.4"
-anyhow = "1"
+getrandom = "0.2"
 zstd = "0.13"
-rand = "0.8"
-clap = { version = "4", features = ["derive"] }
-
-[[bin]]
-name = "wirecap-dump"
-path = "src/bin/dump.rs"
-
-[[bin]]
-name = "wirecap-tail"
-path = "src/bin/tail.rs"
+ferro-buggify = { git = "https://github.com/leroux/ferro-buggify", optional = true }
 
 [dev-dependencies]
+hegeltest = "0.4"
+serial_test = "3"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

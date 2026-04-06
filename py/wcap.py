@@ -1,7 +1,7 @@
 """Streaming reader for WCAP binary wirelog files.
 
-Handles both .wcap and .wcap.zst (zstandard-compressed) files.
-Streams records without loading the full file into memory.
+Handles .wcap, .wcap.zst (zstandard-compressed), and all record versions
+(v1, v2, v3). Streams records without loading the full file into memory.
 
 Usage:
     from wcap import stream_records, Dir
@@ -26,9 +26,10 @@ from typing import Iterator
 MAGIC = b"WCAP"
 FILE_VERSION = 1
 
-# Pre-compiled struct formats
-_V1_HDR = struct.Struct("<QIBB")   # ts(8) + payload_len(4) + src(1) + dir(1) = 14
-_V2_HDR = struct.Struct("<QHIBB")  # ts(8) + meta_len(2) + payload_len(4) + src(1) + dir(1) = 16
+# Pre-compiled struct formats (after the 1-byte version is read separately)
+_V1_HDR = struct.Struct("<QIBB")    # ts(8) + payload_len(4) + src(1) + dir(1) = 14
+_V2_HDR = struct.Struct("<QHIBB")   # ts(8) + meta_len(2) + payload_len(4) + src(1) + dir(1) = 16
+_V3_HDR = struct.Struct("<QQQHIBB") # ts(8) + mono_ns(8) + recv_seq(8) + meta_len(2) + payload_len(4) + src(1) + dir(1) = 32
 
 
 class Dir(IntEnum):
@@ -44,7 +45,9 @@ class FileHeader:
 
 @dataclass(slots=True)
 class Record:
-    ts: int  # nanoseconds since epoch
+    ts: int            # nanoseconds since epoch
+    mono_ns: int | None  # v3 only; None for v1/v2
+    recv_seq: int | None # v3 only; None for v1/v2
     src: int
     dir: int
     meta: bytes
@@ -71,7 +74,7 @@ def _skip(f, n: int, seekable: bool):
     if seekable:
         f.seek(n, 1)
     else:
-        f.read(n)
+        _read_exact(f, n)
 
 
 def read_header(f) -> FileHeader:
@@ -110,27 +113,38 @@ def read_records(
         ver = ver_byte[0]
 
         if ver == 1:
-            hdr = f.read(14)
-            if len(hdr) < 14:
-                return
+            hdr = _read_exact(f, 14)
             ts, payload_len, rec_src, rec_dir = _V1_HDR.unpack(hdr)
             meta_len = 0
+            mono_ns = None
+            recv_seq = None
         elif ver == 2:
-            hdr = f.read(16)
-            if len(hdr) < 16:
-                return
+            hdr = _read_exact(f, 16)
             ts, meta_len, payload_len, rec_src, rec_dir = _V2_HDR.unpack(hdr)
+            mono_ns = None
+            recv_seq = None
+        elif ver == 3:
+            hdr = _read_exact(f, 32)
+            ts, mono_ns, recv_seq, meta_len, payload_len, rec_src, rec_dir = _V3_HDR.unpack(hdr)
         else:
-            return
+            raise ValueError(f"unsupported record version: {ver}")
 
         # Filter check — skip body bytes if record doesn't match
         if filtering and ((src is not None and rec_src != src) or (dir is not None and rec_dir != dir)):
             _skip(f, meta_len + payload_len, seekable)
             continue
 
-        meta = f.read(meta_len) if meta_len > 0 else b""
-        payload = f.read(payload_len)
-        yield Record(ts=ts, src=rec_src, dir=rec_dir, meta=meta, payload=payload)
+        meta = _read_exact(f, meta_len) if meta_len > 0 else b""
+        payload = _read_exact(f, payload_len)
+        yield Record(
+            ts=ts,
+            mono_ns=mono_ns,
+            recv_seq=recv_seq,
+            src=rec_src,
+            dir=rec_dir,
+            meta=meta,
+            payload=payload,
+        )
 
 
 def stream_records(

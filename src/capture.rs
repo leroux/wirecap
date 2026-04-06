@@ -271,7 +271,7 @@ async fn writer_task(
                 drop(of.file);
                 match finalize_file(&of.path) {
                     Ok(final_path) => {
-                        tokio::spawn(async move {
+                        tokio::task::spawn_blocking(move || {
                             compress_file(&final_path);
                         });
                     }
@@ -303,7 +303,11 @@ async fn writer_task(
         }
         drop(of.file);
         match finalize_file(&of.path) {
-            Ok(final_path) => compress_file(&final_path),
+            Ok(final_path) => {
+                let _ = tokio::task::spawn_blocking(move || {
+                    compress_file(&final_path);
+                }).await;
+            }
             Err(e) => {
                 error!(error = %e, path = %of.path.display(), "failed to finalize file on shutdown");
             }
@@ -392,7 +396,7 @@ fn recover_active_files(output_dir: &str) {
                 continue;
             }
             let rp = recovered_path.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
                 compress_file(&rp);
             });
         }
